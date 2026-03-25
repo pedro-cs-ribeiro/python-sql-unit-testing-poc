@@ -1,0 +1,11 @@
+-- =============================================================================
+-- DDL for the daily_stats table used by the template substitution example.
+-- This is loaded as part of test setup for template tests.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS recon_data.daily_stats (
+    stat_date       DATE,
+    entity_type     VARCHAR(50),
+    record_count    INTEGER,
+    created_date    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

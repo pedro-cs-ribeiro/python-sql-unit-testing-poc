@@ -1,0 +1,25 @@
+-- =============================================================================
+-- Template substitution pattern with date placeholder.
+--
+-- Mirrors the production pattern where Python scripts replace @PREV_DATE@
+-- with the actual date before execution. The SQL aggregates daily statistics.
+-- =============================================================================
+
+INSERT INTO recon_data.daily_stats (stat_date, entity_type, record_count, created_date)
+SELECT
+    '@PREV_DATE@'::DATE         AS stat_date,
+    'individual'                AS entity_type,
+    COUNT(*)                    AS record_count,
+    CURRENT_TIMESTAMP           AS created_date
+FROM source_data.individual
+WHERE scm_createdtime::DATE <= '@PREV_DATE@'::DATE
+
+UNION ALL
+
+SELECT
+    '@PREV_DATE@'::DATE         AS stat_date,
+    'contract'                  AS entity_type,
+    COUNT(*)                    AS record_count,
+    CURRENT_TIMESTAMP           AS created_date
+FROM source_data.contract_summary
+WHERE scm_createdtime::DATE <= '@PREV_DATE@'::DATE;

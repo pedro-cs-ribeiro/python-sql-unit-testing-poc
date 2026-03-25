@@ -1,0 +1,28 @@
+-- =============================================================================
+-- INSERT with key mapping pattern.
+--
+-- Mirrors the production pattern that generates surrogate keys by computing
+-- MAX(existing_key) + ROW_NUMBER(), then inserts only records that don't
+-- already exist (idempotent insert).
+-- =============================================================================
+
+INSERT INTO target_data.customer_mapping (customer_id, customer_uri, created_date, created_by)
+SELECT
+    COALESCE(max_key.max_id, 0) + ROW_NUMBER() OVER (PARTITION BY 1) AS customer_id,
+    src.uri AS customer_uri,
+    CURRENT_TIMESTAMP,
+    'batch_load'
+FROM (
+    SELECT TRIM(uri) AS uri
+    FROM source_data.individual
+    GROUP BY 1
+) src
+CROSS JOIN (
+    SELECT COALESCE(MAX(mapping_id), 0) AS max_id
+    FROM target_data.customer_mapping
+) max_key
+WHERE NOT EXISTS (
+    SELECT 'x'
+    FROM target_data.customer_mapping existing
+    WHERE TRIM(existing.customer_uri) = TRIM(src.uri)
+);

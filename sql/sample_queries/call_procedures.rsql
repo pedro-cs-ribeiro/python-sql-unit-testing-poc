@@ -1,0 +1,9 @@
+-- =============================================================================
+-- CALL stored procedure pattern.
+--
+-- Mirrors the production pattern where multiple stored procedures are called
+-- in sequence to process different reconciliation types.
+-- =============================================================================
+
+CALL recon_data.reconcile_reference_data('GENDER', 'MDM', 'RELTIO');
+CALL recon_data.reconcile_reference_data('MARITAL_STATUS', 'MDM', 'RELTIO');

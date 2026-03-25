@@ -1,0 +1,48 @@
+-- =============================================================================
+-- CTAS (CREATE TABLE AS SELECT) pattern with reconciliation logic.
+--
+-- Mirrors the production pattern from weekly recon scripts that compare
+-- data between two sources and flag mismatches. Uses Redshift-specific
+-- syntax (DISTKEY, SORTKEY, NVL, DECODE) that the compatibility layer
+-- must handle.
+-- =============================================================================
+
+DROP TABLE IF EXISTS recon_data.customer_recon;
+
+CREATE TABLE recon_data.customer_recon
+DISTKEY(customer_id)
+SORTKEY(customer_id)
+AS
+SELECT
+    COALESCE(src.customer_id, tgt.customer_id)  AS customer_id,
+    src.given_name_one                          AS src_given_name,
+    tgt.given_name_one                          AS tgt_given_name,
+    src.family_name                             AS src_family_name,
+    tgt.family_name                             AS tgt_family_name,
+    src.date_of_birth                           AS src_dob,
+    tgt.date_of_birth                           AS tgt_dob,
+    src.gender                                  AS src_gender,
+    tgt.gender                                  AS tgt_gender,
+    -- Mismatch flags (1 = mismatch, 0 = match)
+    CASE WHEN NVL(src.given_name_one, '') <> NVL(tgt.given_name_one, '') THEN 1 ELSE 0 END AS name_match_status,
+    CASE WHEN NVL(src.family_name, '')   <> NVL(tgt.family_name, '')     THEN 1 ELSE 0 END AS surname_match_status,
+    CASE WHEN NVL(CAST(src.date_of_birth AS VARCHAR), '') <> NVL(CAST(tgt.date_of_birth AS VARCHAR), '') THEN 1 ELSE 0 END AS dob_match_status,
+    CASE WHEN NVL(src.gender, '')        <> NVL(tgt.gender, '')          THEN 1 ELSE 0 END AS gender_match_status,
+    -- Overall match: sum of individual mismatches
+    (CASE WHEN NVL(src.given_name_one, '') <> NVL(tgt.given_name_one, '') THEN 1 ELSE 0 END
+   + CASE WHEN NVL(src.family_name, '')   <> NVL(tgt.family_name, '')     THEN 1 ELSE 0 END
+   + CASE WHEN NVL(CAST(src.date_of_birth AS VARCHAR), '') <> NVL(CAST(tgt.date_of_birth AS VARCHAR), '') THEN 1 ELSE 0 END
+   + CASE WHEN NVL(src.gender, '')        <> NVL(tgt.gender, '')          THEN 1 ELSE 0 END
+    ) AS match_status,
+    SYSDATE AS recon_date
+FROM source_data.individual src
+FULL OUTER JOIN target_data.individual tgt
+    ON src.customer_id = tgt.customer_id
+WHERE
+    (CASE WHEN NVL(src.given_name_one, '') <> NVL(tgt.given_name_one, '') THEN 1 ELSE 0 END
+   + CASE WHEN NVL(src.family_name, '')   <> NVL(tgt.family_name, '')     THEN 1 ELSE 0 END
+   + CASE WHEN NVL(CAST(src.date_of_birth AS VARCHAR), '') <> NVL(CAST(tgt.date_of_birth AS VARCHAR), '') THEN 1 ELSE 0 END
+   + CASE WHEN NVL(src.gender, '')        <> NVL(tgt.gender, '')          THEN 1 ELSE 0 END
+    ) > 0;
+
+ANALYZE recon_data.customer_recon;

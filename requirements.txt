@@ -1,0 +1,7 @@
+# Core
+psycopg2-binary>=2.9.9
+
+# Testing
+pytest>=8.0.0
+testcontainers[postgres]>=4.4.0
+pytest-cov>=5.0.0

@@ -1,0 +1,34 @@
+-- =============================================================================
+-- TRUNCATE + INSERT pattern.
+--
+-- Mirrors the production pattern where a target table is cleared and
+-- reloaded from source data with transformations. Uses NVL, DECODE,
+-- and TRIM patterns found in the real .rsql files.
+-- =============================================================================
+
+TRUNCATE TABLE target_data.individual;
+
+INSERT INTO target_data.individual
+    (uri, customer_id, given_name_one, family_name, date_of_birth,
+     gender, marital_status, citizenship, deceased_date,
+     last_updated_date, last_updated_user, scm_createdtime, scm_updatedtime)
+SELECT
+    src.uri,
+    src.customer_id,
+    NULLIF(TRIM(src.given_name_one), '')        AS given_name_one,
+    NULLIF(TRIM(src.family_name), '')           AS family_name,
+    src.date_of_birth,
+    DECODE(src.gender,
+        'Male',   'M',
+        'Female', 'F',
+        'U')                                    AS gender,
+    NVL(src.marital_status, 'Unknown')          AS marital_status,
+    NVL(src.citizenship, 'Unknown')             AS citizenship,
+    src.deceased_date,
+    NVL(src.last_updated_date, SYSDATE)         AS last_updated_date,
+    NVL(src.last_updated_user, 'system')        AS last_updated_user,
+    SYSDATE                                     AS scm_createdtime,
+    SYSDATE                                     AS scm_updatedtime
+FROM source_data.individual src;
+
+ANALYZE target_data.individual;

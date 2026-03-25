@@ -1,0 +1,62 @@
+-- =============================================================================
+-- Stored procedure pattern.
+--
+-- Mirrors the production pattern where PL/pgSQL procedures encapsulate
+-- reconciliation logic with dynamic SQL. The procedure takes parameters
+-- and builds queries dynamically.
+--
+-- In Redshift these use CREATE OR REPLACE PROCEDURE ... LANGUAGE plpgsql,
+-- which is also valid PostgreSQL syntax (no compatibility changes needed).
+-- =============================================================================
+
+CREATE OR REPLACE PROCEDURE recon_data.reconcile_reference_data(
+    p_lookup_type VARCHAR,
+    p_source_system_a VARCHAR,
+    p_source_system_b VARCHAR
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_sql TEXT;
+    v_table_name TEXT;
+BEGIN
+    v_table_name := 'recon_data.recon_' || LOWER(p_lookup_type);
+
+    -- Drop existing recon table if it exists
+    EXECUTE 'DROP TABLE IF EXISTS ' || v_table_name;
+
+    -- Create recon table comparing two source systems
+    v_sql := '
+        CREATE TABLE ' || v_table_name || ' AS
+        SELECT
+            COALESCE(a.lookup_code, b.lookup_code) AS lookup_code,
+            a.lookup_value AS value_system_a,
+            b.lookup_value AS value_system_b,
+            CASE
+                WHEN a.lookup_code IS NULL THEN ''MISSING_IN_A''
+                WHEN b.lookup_code IS NULL THEN ''MISSING_IN_B''
+                WHEN a.lookup_value <> b.lookup_value THEN ''MISMATCH''
+                ELSE ''MATCH''
+            END AS recon_status
+        FROM (
+            SELECT lookup_code, lookup_value
+            FROM source_data.reference_data
+            WHERE lookup_type = ''' || p_lookup_type || '''
+              AND source_system = ''' || p_source_system_a || '''
+              AND active_flag = TRUE
+        ) a
+        FULL OUTER JOIN (
+            SELECT lookup_code, lookup_value
+            FROM source_data.reference_data
+            WHERE lookup_type = ''' || p_lookup_type || '''
+              AND source_system = ''' || p_source_system_b || '''
+              AND active_flag = TRUE
+        ) b ON a.lookup_code = b.lookup_code
+        WHERE COALESCE(a.lookup_value, '''') <> COALESCE(b.lookup_value, '''')
+           OR a.lookup_code IS NULL
+           OR b.lookup_code IS NULL
+    ';
+
+    EXECUTE v_sql;
+END;
+$$;

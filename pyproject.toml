@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "rsql-unit-testing-poc"
+version = "0.1.0"
+description = "POC for unit testing Redshift SQL (.rsql) scripts using pytest and Testcontainers"
+requires-python = ">=3.9"
+dependencies = [
+    "psycopg2-binary>=2.9.9",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "testcontainers[postgres]>=4.4.0",
+    "pytest-cov>=5.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["src", "redshift_compat"]
+
+[tool.coverage.report]
+show_missing = true

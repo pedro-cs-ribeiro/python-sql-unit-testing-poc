@@ -1,0 +1,15 @@
+-- =============================================================================
+-- DELETE pattern.
+--
+-- Mirrors the production pattern that deletes records from a target table
+-- when matching records exist in a source table, typically used to remove
+-- stale data before a reload.
+-- =============================================================================
+
+DELETE FROM target_data.individual
+WHERE EXISTS (
+    SELECT 1
+    FROM source_data.individual src
+    WHERE src.customer_id = target_data.individual.customer_id
+      AND src.scm_createdtime < CURRENT_DATE
+);
