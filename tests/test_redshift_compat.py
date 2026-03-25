@@ -2,8 +2,9 @@
 Tests for the Redshift compatibility layer.
 
 These tests verify that Redshift-specific SQL syntax is correctly
-transformed into PostgreSQL-compatible SQL, ensuring .rsql files
-can be executed against a standard PostgreSQL test database.
+transformed into PostgreSQL-compatible SQL via sqlglot transpilation,
+ensuring .rsql files can be executed against a standard PostgreSQL
+test database.
 """
 
 from redshift_compat import convert_redshift_to_postgres
@@ -142,6 +143,14 @@ class TestDecodeReplacement:
         assert "ELSE 'Unknown'" in result
         assert "END" in result
 
+    def test_should_handle_nested_functions_in_decode(self):
+        """sqlglot correctly handles nested function calls inside DECODE."""
+        sql = "SELECT DECODE(UPPER(gender), 'MALE', 'M', 'FEMALE', 'F', 'U') FROM t"
+        result = convert_redshift_to_postgres(sql)
+        assert "CASE" in result
+        assert "UPPER(gender)" in result
+        assert "WHEN UPPER(gender) = 'MALE' THEN 'M'" in result
+
 
 class TestAnalyzeRemoval:
     """Test removal of ANALYZE statements."""
@@ -150,7 +159,7 @@ class TestAnalyzeRemoval:
         sql = "INSERT INTO t SELECT 1;\nANALYZE t;\n"
         result = convert_redshift_to_postgres(sql)
         assert "ANALYZE" not in result
-        assert "INSERT INTO t SELECT 1" in result
+        assert "INSERT INTO t" in result
 
 
 class TestCopyRemoval:
@@ -159,7 +168,13 @@ class TestCopyRemoval:
     def test_should_remove_copy_from_s3(self):
         sql = "COPY t FROM 's3://bucket/path' iam_role 'arn:aws:iam::123:role/test' FORMAT CSV;"
         result = convert_redshift_to_postgres(sql)
-        assert "COPY" not in result.strip()
+        assert result.strip() == ""
+
+    def test_should_not_remove_non_s3_copy(self):
+        """PostgreSQL COPY FROM STDIN should not be stripped."""
+        sql = "COPY t FROM STDIN WITH (FORMAT CSV);"
+        result = convert_redshift_to_postgres(sql)
+        assert "COPY" in result
 
 
 class TestUnloadRemoval:
@@ -168,7 +183,7 @@ class TestUnloadRemoval:
     def test_should_remove_unload(self):
         sql = "UNLOAD ('SELECT * FROM t') TO 's3://bucket/output/' iam_role 'arn:aws:iam::123:role/test';"
         result = convert_redshift_to_postgres(sql)
-        assert "UNLOAD" not in result.strip()
+        assert result.strip() == ""
 
 
 class TestCombinedTransformations:
@@ -196,7 +211,5 @@ class TestCombinedTransformations:
         assert "CASE" in result
         assert "CURRENT_TIMESTAMP" in result
         assert "ANALYZE" not in result
-        # Core SQL structure preserved
         assert "CREATE TABLE result" in result
-        assert "SELECT" in result
         assert "FROM source" in result

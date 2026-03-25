@@ -11,7 +11,13 @@ Many data engineering pipelines execute raw `.rsql` files against Amazon Redshif
 - No way to test locally without access to a Redshift cluster
 - Orchestration via Apache Airflow (or similar) with Python executor scripts
 
-This POC demonstrates how to test these `.rsql` files locally using a PostgreSQL container as a Redshift substitute, with a compatibility layer that handles Redshift-specific syntax differences.
+This POC demonstrates how to test these `.rsql` files locally using a PostgreSQL container as a Redshift substitute, with [sqlglot](https://github.com/tobymao/sqlglot) handling the dialect translation.
+
+## What This Tests
+
+This POC tests **SQL logic correctness**: do your JOINs, aggregations, CASE expressions, and data transformations produce the right rows? It does this by transpiling Redshift SQL to PostgreSQL and running it against a local container.
+
+For most teams, logic correctness is where the bugs are. If your SQL produces wrong results, the issue is almost always in the logic (a bad JOIN condition, a missing NULL check, an off-by-one in a date filter) rather than a Redshift-vs-PostgreSQL behavioural difference. This POC catches those bugs.
 
 ## Architecture
 
@@ -41,12 +47,12 @@ pytest
       -> rsql_executor.py:
           -> Reads the .rsql file (same as production)
           -> Applies template substitution (same as production)
-          -> Applies Redshift-to-PostgreSQL compatibility transforms (NEW)
+          -> Transpiles Redshift SQL to PostgreSQL via sqlglot
           -> Executes via psycopg2 (replaces rsql CLI)
       -> Test assertions validate database state
 ```
 
-The key insight is that `rsql_executor.py` mirrors the production `execute_sql_scripts.py` flow, but replaces the `rsql` CLI (which requires a Redshift cluster) with `psycopg2` (which connects to a local PostgreSQL container). A compatibility layer bridges the syntax differences.
+The key insight is that `rsql_executor.py` mirrors the production `execute_sql_scripts.py` flow, but replaces the `rsql` CLI (which requires a Redshift cluster) with `psycopg2` (which connects to a local PostgreSQL container). sqlglot bridges the dialect differences.
 
 ## Project Structure
 
@@ -56,8 +62,7 @@ rsql-unit-testing-poc/
 ├── requirements.txt                    # Python dependencies
 ├── conftest.py                         # Root conftest (adds project to sys.path)
 ├── redshift_compat/
-│   ├── __init__.py                     # Redshift-to-PostgreSQL SQL transformer
-│   └── compat.py                       # Re-exports for convenience
+│   └── __init__.py                     # Redshift-to-PostgreSQL transpiler (sqlglot)
 ├── src/
 │   ├── __init__.py
 │   └── rsql_executor.py               # Executes .rsql files against PostgreSQL
@@ -100,24 +105,33 @@ These patterns were identified from real production pipelines and are represente
 
 ## Redshift Compatibility Layer
 
-Amazon Redshift is based on PostgreSQL but has significant syntax differences. The compatibility layer (`redshift_compat/__init__.py`) handles these transformations:
+The compatibility layer (`redshift_compat/__init__.py`) uses [sqlglot](https://github.com/tobymao/sqlglot) to parse Redshift SQL into an AST and generate PostgreSQL-compatible SQL. This is a proper SQL transpiler that correctly handles nested expressions, quoting, and dialect differences. Infrastructure commands that aren't relevant to logic testing (ANALYZE, COPY, UNLOAD) are stripped via a small regex pre-processing step.
 
-| Redshift Syntax | PostgreSQL Equivalent | Transformation |
-|---|---|---|
-| `DISTKEY(col)` | *(removed)* | Table distribution — not applicable to PostgreSQL |
-| `SORTKEY(col)` | *(removed)* | Table sort order — not applicable to PostgreSQL |
-| `COMPOUND SORTKEY(...)` | *(removed)* | Compound sort keys |
-| `INTERLEAVED SORTKEY(...)` | *(removed)* | Interleaved sort keys |
-| `DISTSTYLE KEY\|ALL\|EVEN` | *(removed)* | Distribution style |
-| `ENCODE LZO\|ZSTD\|...` | *(removed)* | Column compression encoding |
-| `DECODE(expr, v1, r1, ..., default)` | `CASE WHEN expr=v1 THEN r1 ... ELSE default END` | Conditional expression |
-| `NVL(a, b)` | `COALESCE(a, b)` | NULL handling |
-| `SYSDATE` | `CURRENT_TIMESTAMP` | Current timestamp |
-| `GETDATE()` | `CURRENT_TIMESTAMP` | Current timestamp |
-| `CHARINDEX(sub, str)` | `POSITION(sub IN str)` | String search |
-| `ANALYZE table` | *(removed)* | Statistics update — unnecessary in tests |
-| `COPY ... FROM 's3://...'` | *(removed)* | S3 data loading — infrastructure-specific |
-| `UNLOAD (...) TO 's3://...'` | *(removed)* | S3 data export — infrastructure-specific |
+## Testing Against Real Redshift
+
+For highest fidelity testing, you can run tests directly against an Amazon Redshift Serverless workgroup. This eliminates the need for any compatibility layer — your `.rsql` files execute against the real engine.
+
+### How to set it up
+
+1. Create a Redshift Serverless workgroup with auto-pause enabled (no cost when idle, ~$0.375/RPU-hour when active)
+2. Replace the Testcontainers fixture with a connection to your Redshift endpoint
+3. Set `skip_compatibility=True` in `execute_rsql_file()` calls — no transpilation needed
+4. Store credentials via AWS Secrets Manager or environment variables in CI
+
+```python
+@pytest.fixture(scope="session")
+def db_conn():
+    """Connect to Redshift Serverless for integration tests."""
+    conn = psycopg2.connect(
+        host=os.environ["REDSHIFT_HOST"],
+        port=5439,
+        dbname=os.environ["REDSHIFT_DB"],
+        user=os.environ["REDSHIFT_USER"],
+        password=os.environ["REDSHIFT_PASSWORD"],
+    )
+    yield conn
+    conn.close()
+```
 
 ## Prerequisites
 
@@ -151,80 +165,6 @@ pytest --cov=src --cov=redshift_compat --cov-report=term-missing
 pytest tests/test_ctas_queries.py -v
 ```
 
-## How to Integrate Into Your Pipeline Repository
-
-### Step 1: Add test dependencies
-
-Add the following to your pipeline project (via `requirements.txt` or `pyproject.toml`):
-
-```
-pytest>=8.0.0
-testcontainers[postgres]>=4.4.0
-psycopg2-binary>=2.9.9
-```
-
-### Step 2: Copy the core modules
-
-Copy these into your project:
-
-- `redshift_compat/__init__.py` — the Redshift-to-PostgreSQL compatibility layer
-- `src/rsql_executor.py` — the test-oriented SQL executor
-
-### Step 3: Create your schema and seed data
-
-Derive your test schema from your production DDL files:
-
-1. Take your production DDL (e.g., `Entities_DDL.sql`)
-2. Run it through the compatibility layer to strip Redshift-specific syntax
-3. Save as `tests/sql/schema.sql`
-4. Create seed data that exercises your SQL logic in `tests/sql/seed_data.sql`
-
-### Step 4: Write tests for your .rsql files
-
-Follow the patterns in the `tests/` directory. For each `.rsql` file you want to test:
-
-1. Set up the required database state (schema + seed data via fixtures)
-2. Execute the `.rsql` file using `execute_rsql_file()`
-3. Assert the expected database state after execution
-
-```python
-from src.rsql_executor import execute_rsql_file
-
-def test_my_rsql_script(db_conn):
-    """Test that my_script.rsql produces expected results."""
-    execute_rsql_file(db_conn, "sql/my_script.rsql")
-
-    with db_conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM target_schema.target_table")
-        count = cur.fetchone()[0]
-
-    assert count == 42
-```
-
-### Step 5: Add to CI/CD pipeline
-
-Add a test stage to your pipeline configuration. Example for Azure DevOps:
-
-```yaml
-- stage: Test
-  jobs:
-    - job: SQLUnitTests
-      pool:
-        vmImage: 'ubuntu-latest'
-      steps:
-        - task: UsePythonVersion@0
-          inputs:
-            versionSpec: '3.11'
-        - script: |
-            pip install -r requirements.txt
-            pytest --junitxml=test-results.xml --cov=src --cov-report=xml
-          displayName: 'Run SQL unit tests'
-        - task: PublishTestResults@2
-          inputs:
-            testResultsFormat: 'JUnit'
-            testResultsFiles: 'test-results.xml'
-```
-
 ## Test Fixtures
 
 The `tests/conftest.py` provides two main fixtures:
@@ -237,38 +177,3 @@ The `tests/conftest.py` provides two main fixtures:
 
 The PostgreSQL container is started **once per test session** (not per test) for performance. Each test gets a fresh database state via `DROP SCHEMA CASCADE` + recreation.
 
-## Limitations
-
-1. **COPY/UNLOAD commands are stripped** — These are Redshift-specific S3 operations that cannot be tested against PostgreSQL. If your SQL logic depends on data loaded via COPY, you need to seed that data via INSERT statements in your test setup.
-
-2. **Some Redshift functions may not have PostgreSQL equivalents** — The compatibility layer handles the most common cases. If you encounter unsupported functions, extend `redshift_compat/__init__.py` with additional transformations.
-
-3. **Redshift-specific data types** — Some Redshift types (e.g., `SUPER`, `HLLSKETCH`, `GEOMETRY`) don't exist in PostgreSQL. The current compatibility layer does not handle type conversions.
-
-4. **Query performance characteristics differ** — PostgreSQL won't reflect Redshift's distribution and sort key optimisations. Tests validate correctness, not performance.
-
-5. **External dependencies** — SQL that references external resources (S3, Vault, SFG, etc.) must be mocked or excluded from unit tests.
-
-## Extending the Compatibility Layer
-
-To add support for additional Redshift-specific syntax:
-
-1. Add a new transformation function in `redshift_compat/__init__.py`
-2. Call it from `convert_redshift_to_postgres()`
-3. Add tests in `tests/test_redshift_compat.py`
-
-Example:
-
-```python
-def _replace_regexp_substr(sql: str) -> str:
-    """Replace Redshift REGEXP_SUBSTR with PostgreSQL equivalent."""
-    # Redshift: REGEXP_SUBSTR(string, pattern)
-    # PostgreSQL: SUBSTRING(string FROM pattern)
-    sql = re.sub(
-        r'\bREGEXP_SUBSTR\s*\((.+?),\s*(.+?)\)',
-        r'SUBSTRING(\1 FROM \2)',
-        sql,
-        flags=re.IGNORECASE,
-    )
-    return sql
-```

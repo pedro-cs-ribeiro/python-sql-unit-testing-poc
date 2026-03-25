@@ -107,9 +107,16 @@ def _execute_statements(conn: PgConnection, sql: str) -> None:
     with conn.cursor() as cur:
         for stmt in statements:
             stmt = stmt.strip()
-            if stmt:
+            if stmt and _has_sql_content(stmt):
                 cur.execute(stmt)
     conn.commit()
+
+
+def _has_sql_content(stmt: str) -> bool:
+    """Check if a statement contains actual SQL, not just comments/whitespace."""
+    cleaned = re.sub(r'--[^\n]*', '', stmt)
+    cleaned = re.sub(r'/\*.*?\*/', '', cleaned, flags=re.DOTALL)
+    return bool(cleaned.strip())
 
 
 def _split_statements(sql: str) -> list[str]:

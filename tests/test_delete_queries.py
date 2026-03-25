@@ -24,6 +24,14 @@ class TestDeleteQuery:
         Records in target that match source (by customer_id) should be deleted
         when the source scm_createdtime is before today.
         """
+        # Set source scm_createdtime to the past so the WHERE clause matches
+        with db_conn.cursor() as cur:
+            cur.execute("""
+                UPDATE source_data.individual
+                SET scm_createdtime = '2024-01-01 00:00:00'
+                WHERE customer_id IN ('CUST001', 'CUST002')
+            """)
+
         # Pre-populate target with records that match source
         with db_conn.cursor() as cur:
             cur.execute("""
@@ -40,8 +48,7 @@ class TestDeleteQuery:
             cur.execute("SELECT COUNT(*) FROM target_data.individual")
             count = cur.fetchone()[0]
 
-        # Both should be deleted (source scm_createdtime defaults to
-        # CURRENT_TIMESTAMP which is before CURRENT_DATE's end)
+        # Both should be deleted (source scm_createdtime is in the past)
         assert count == 0
 
     def test_should_not_delete_records_without_source_match(

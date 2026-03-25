@@ -1,5 +1,6 @@
 # Core
 psycopg2-binary>=2.9.9
+sqlglot>=26.0.0
 
 # Testing
 pytest>=8.0.0

@@ -1,20 +1,30 @@
 """
 Redshift SQL compatibility layer for PostgreSQL.
 
-Transforms Redshift-specific SQL syntax into PostgreSQL-compatible SQL,
-enabling .rsql files to be tested against a standard PostgreSQL instance.
+Uses sqlglot to parse Redshift SQL into an AST and generate PostgreSQL-compatible
+SQL. This replaces hand-written regex transformations with a proper SQL transpiler
+that correctly handles nested expressions, quoting, and dialect differences.
+
+A small number of regex pre-processing steps handle syntax that sqlglot's Redshift
+parser does not cover (inline DISTKEY keyword, INTERLEAVED SORTKEY) and statements
+that should be stripped entirely for testing (ANALYZE, COPY FROM S3, UNLOAD).
 """
 
 import re
+
+import sqlglot
+from sqlglot import exp
 
 
 def convert_redshift_to_postgres(sql: str) -> str:
     """
     Convert Redshift-specific SQL to PostgreSQL-compatible SQL.
 
-    Applies a series of transformations to handle syntax differences between
-    Amazon Redshift and standard PostgreSQL. This allows .rsql files written
-    for Redshift to execute against a PostgreSQL test database.
+    Uses sqlglot to transpile from the Redshift dialect to PostgreSQL,
+    handling function replacements (DECODE, NVL, SYSDATE, GETDATE, CHARINDEX),
+    and stripping Redshift-specific DDL properties (DISTKEY, SORTKEY, DISTSTYLE,
+    ENCODE). Infrastructure commands (ANALYZE, COPY, UNLOAD) are removed via
+    regex pre-processing since they are not relevant to logic testing.
 
     Args:
         sql: Raw SQL string from a .rsql file.
@@ -22,19 +32,16 @@ def convert_redshift_to_postgres(sql: str) -> str:
     Returns:
         Transformed SQL string compatible with PostgreSQL.
     """
-    sql = _remove_distkey(sql)
-    sql = _remove_sortkey(sql)
-    sql = _remove_diststyle(sql)
-    sql = _remove_encode(sql)
-    sql = _replace_decode(sql)
-    sql = _replace_nvl(sql)
-    sql = _replace_sysdate(sql)
-    sql = _replace_charindex(sql)
-    sql = _replace_getdate(sql)
-    sql = _remove_analyze(sql)
-    sql = _remove_copy_commands(sql)
-    sql = _remove_unload_commands(sql)
-    return sql
+    sql = _pre_process(sql)
+
+    results = []
+    for statement in sqlglot.parse(sql, read="redshift"):
+        if statement is None:
+            continue
+        _strip_redshift_properties(statement)
+        results.append(statement.sql(dialect="postgres"))
+
+    return ";\n".join(results)
 
 
 def apply_template_substitution(sql: str, variables: dict[str, str]) -> str:
@@ -54,226 +61,60 @@ def apply_template_substitution(sql: str, variables: dict[str, str]) -> str:
         SQL string with placeholders replaced.
     """
     for key, value in variables.items():
-        # Support @VAR@ style placeholders
         sql = sql.replace(f"@{key}@", value)
-        # Support $VAR style placeholders
         sql = sql.replace(f"${key}", value)
     return sql
 
 
 # ---------------------------------------------------------------------------
-# Internal transformation functions
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _remove_distkey(sql: str) -> str:
-    """Remove DISTKEY(...) clauses from CREATE TABLE and column definitions."""
-    # Remove standalone DISTKEY(column) clauses
-    sql = re.sub(r'\bDISTKEY\s*\([^)]*\)', '', sql, flags=re.IGNORECASE)
-    # Remove DISTKEY keyword when used as column constraint (e.g., PRIMARY KEY DISTKEY)
-    sql = re.sub(r'\bDISTKEY\b', '', sql, flags=re.IGNORECASE)
-    return sql
-
-
-def _remove_sortkey(sql: str) -> str:
-    """Remove SORTKEY(...) and COMPOUND SORTKEY(...) / INTERLEAVED SORTKEY(...)."""
-    sql = re.sub(
-        r'\b(COMPOUND\s+|INTERLEAVED\s+)?SORTKEY\s*\([^)]*\)',
-        '',
-        sql,
-        flags=re.IGNORECASE,
-    )
-    return sql
-
-
-def _remove_diststyle(sql: str) -> str:
-    """Remove DISTSTYLE KEY|ALL|EVEN clauses."""
-    sql = re.sub(
-        r'\bDISSTYLE\s+(KEY|ALL|EVEN|AUTO)\b', '', sql, flags=re.IGNORECASE
-    )
-    sql = re.sub(
-        r'\bDISTSTYLE\s+(KEY|ALL|EVEN|AUTO)\b', '', sql, flags=re.IGNORECASE
-    )
-    return sql
-
-
-def _remove_encode(sql: str) -> str:
-    """Remove ENCODE compression_type from column definitions."""
-    sql = re.sub(
-        r'\bENCODE\s+(RAW|AZ64|BYTEDICT|DELTA|DELTA32K|LZO|MOSTLY8|MOSTLY16|MOSTLY32|RUNLENGTH|TEXT255|TEXT32K|ZSTD)\b',
-        '',
-        sql,
-        flags=re.IGNORECASE,
-    )
-    return sql
-
-
-def _replace_decode(sql: str) -> str:
+def _pre_process(sql: str) -> str:
     """
-    Replace Redshift DECODE(expr, val1, result1, ..., default) with
-    PostgreSQL CASE WHEN expressions.
-
-    DECODE is equivalent to:
-        CASE WHEN expr = val1 THEN result1
-             WHEN expr = val2 THEN result2
-             ...
-             ELSE default
-        END
+    Regex pre-processing for syntax that sqlglot's Redshift parser does not
+    handle, and for commands that should be stripped entirely in tests.
     """
-
-    def _decode_to_case(match: re.Match) -> str:
-        inner = match.group(1)
-        args = _split_sql_args(inner)
-        if len(args) < 3:
-            return match.group(0)  # Not a valid DECODE, leave as-is
-
-        expr = args[0].strip()
-        pairs = args[1:]
-        parts = ["CASE"]
-        i = 0
-        while i + 1 < len(pairs):
-            parts.append(f" WHEN {expr} = {pairs[i].strip()} THEN {pairs[i+1].strip()}")
-            i += 2
-        if i < len(pairs):
-            parts.append(f" ELSE {pairs[i].strip()}")
-        parts.append(" END")
-        return "".join(parts)
-
-    # Match DECODE(...) but not other functions ending in "decode"
+    # Inline DISTKEY keyword (e.g., 'PRIMARY KEY DISTKEY') — not a function call
+    sql = re.sub(r"\bDISTKEY\b(?!\s*\()", "", sql, flags=re.IGNORECASE)
+    # INTERLEAVED SORTKEY — sqlglot only handles plain and COMPOUND SORTKEY
     sql = re.sub(
-        r'\bDECODE\s*\((.+?)\)(?=\s*(?:AS\b|,|\s|$|\)))',
-        _decode_to_case,
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
+        r"\bINTERLEAVED\s+SORTKEY\s*\([^)]*\)", "", sql, flags=re.IGNORECASE
     )
-    return sql
-
-
-def _replace_nvl(sql: str) -> str:
-    """Replace NVL(a, b) with COALESCE(a, b)."""
-    sql = re.sub(r'\bNVL\s*\(', 'COALESCE(', sql, flags=re.IGNORECASE)
-    return sql
-
-
-def _replace_sysdate(sql: str) -> str:
-    """Replace SYSDATE with CURRENT_TIMESTAMP."""
-    sql = re.sub(r'\bSYSDATE\b', 'CURRENT_TIMESTAMP', sql, flags=re.IGNORECASE)
-    return sql
-
-
-def _replace_charindex(sql: str) -> str:
-    """
-    Replace CHARINDEX(substr, str) with POSITION(substr IN str).
-
-    Redshift: CHARINDEX(substring, string)
-    PostgreSQL: POSITION(substring IN string)
-    """
-    def _charindex_to_position(match: re.Match) -> str:
-        args = _split_sql_args(match.group(1))
-        if len(args) != 2:
-            return match.group(0)
-        return f"POSITION({args[0].strip()} IN {args[1].strip()})"
-
+    # ANALYZE — valid in PostgreSQL but unnecessary overhead in tests
     sql = re.sub(
-        r'\bCHARINDEX\s*\((.+?)\)',
-        _charindex_to_position,
-        sql,
-        flags=re.IGNORECASE,
+        r"^\s*ANALYZE\b[^;]*;", "", sql, flags=re.IGNORECASE | re.MULTILINE
     )
-    return sql
-
-
-def _replace_getdate(sql: str) -> str:
-    """Replace GETDATE() with CURRENT_TIMESTAMP."""
-    sql = re.sub(r'\bGETDATE\s*\(\s*\)', 'CURRENT_TIMESTAMP', sql, flags=re.IGNORECASE)
-    return sql
-
-
-def _remove_analyze(sql: str) -> str:
-    """
-    Remove standalone ANALYZE statements.
-
-    Redshift uses ANALYZE to update table statistics after bulk operations.
-    PostgreSQL has ANALYZE too, but in a test context it's unnecessary overhead.
-    """
+    # COPY ... FROM 's3://...' — Redshift S3 loading, not testable locally
     sql = re.sub(
-        r'^\s*ANALYZE\b[^;]*;',
-        '',
+        r"^\s*COPY\b[^;]*FROM\s+'s3://[^;]*;",
+        "",
         sql,
         flags=re.IGNORECASE | re.MULTILINE,
     )
-    return sql
-
-
-def _remove_copy_commands(sql: str) -> str:
-    """
-    Remove Redshift COPY commands (S3 loading).
-
-    COPY ... FROM 's3://...' iam_role '...' cannot be executed against PostgreSQL.
-    These commands are infrastructure-specific and not part of SQL logic testing.
-    """
+    # UNLOAD (...) TO 's3://...' — Redshift S3 export, not testable locally
     sql = re.sub(
-        r'^\s*COPY\b[^;]*;',
-        '',
-        sql,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    return sql
-
-
-def _remove_unload_commands(sql: str) -> str:
-    """
-    Remove Redshift UNLOAD commands (S3 export).
-
-    UNLOAD ('SELECT ...') TO 's3://...' cannot be executed against PostgreSQL.
-    """
-    sql = re.sub(
-        r'^\s*UNLOAD\s*\(.*?\)\s*TO\b[^;]*;',
-        '',
+        r"^\s*UNLOAD\s*\(.*?\)\s*TO\b[^;]*;",
+        "",
         sql,
         flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
     )
-    # Handle unload without parenthesized query
-    sql = re.sub(
-        r'^\s*UNLOAD\b[^;]*;',
-        '',
-        sql,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
     return sql
 
 
-def _split_sql_args(s: str) -> list[str]:
+def _strip_redshift_properties(statement: exp.Expression) -> None:
     """
-    Split a comma-separated SQL argument string, respecting nested parentheses
-    and quoted strings.
+    Remove Redshift-specific DDL properties from a parsed AST node.
+
+    Strips DISTKEY, SORTKEY, DISTSTYLE (table-level) and ENCODE (column-level)
+    properties that have no PostgreSQL equivalent.
     """
-    args = []
-    depth = 0
-    current = []
-    in_single_quote = False
-    in_double_quote = False
-
-    for char in s:
-        if char == "'" and not in_double_quote:
-            in_single_quote = not in_single_quote
-            current.append(char)
-        elif char == '"' and not in_single_quote:
-            in_double_quote = not in_double_quote
-            current.append(char)
-        elif char == '(' and not in_single_quote and not in_double_quote:
-            depth += 1
-            current.append(char)
-        elif char == ')' and not in_single_quote and not in_double_quote:
-            depth -= 1
-            current.append(char)
-        elif char == ',' and depth == 0 and not in_single_quote and not in_double_quote:
-            args.append(''.join(current))
-            current = []
-        else:
-            current.append(char)
-
-    if current:
-        args.append(''.join(current))
-
-    return args
+    for node in list(statement.walk()):
+        if isinstance(
+            node,
+            (exp.DistKeyProperty, exp.SortKeyProperty, exp.DistStyleProperty),
+        ):
+            node.pop()
+        if isinstance(node, exp.EncodeColumnConstraint):
+            node.parent.pop()
