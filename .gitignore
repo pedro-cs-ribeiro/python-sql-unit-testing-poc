@@ -18,3 +18,4 @@ ENV/
 
 # PGlite Node.js dependencies (run `npm install` in .pglite/ to regenerate)
 .pglite/node_modules/
+.pglite/pglite_manager.js
